@@ -194,6 +194,50 @@ class NativeStorageClientTest < Minitest::Test
     assert_equal 3, requests.last.fetch("sequence")
   end
 
+  def test_sub_file_rejection_14_falls_back_to_full_download
+    # X2D firmware rejects SUB_FILE extraction with result 14 while a print
+    # is active; the plugin must fall back to the full FILE_DOWNLOAD path.
+    # https://github.com/ypMrg/omarchy-bambu-companion/issues/7
+    archive = "abcdef".b
+    transcript = frame(LOGIN_ACK, "") +
+                 control_frame("mtype" => 12_291, "sequence" => 0, "result" => 0) +
+                 control_frame(
+                   "mtype" => 12_289, "cmdtype" => 1, "sequence" => 1, "result" => 0,
+                   "reply" => { "file_lists" => [
+                     { "name" => "Part.gcode.3mf", "path" => "/cache/Part.gcode.3mf",
+                       "size" => archive.bytesize }
+                   ] }
+                 ) +
+                 control_frame(
+                   "mtype" => 12_289, "cmdtype" => 2, "sequence" => 2, "result" => 14
+                 ) +
+                 control_frame(
+                   {
+                     "mtype" => 12_289, "cmdtype" => 4, "sequence" => 3, "result" => 0,
+                     "reply" => { "size" => 6, "offset" => 0, "total" => 6,
+                                  "file_md5" => Digest::MD5.hexdigest(archive) }
+                   }, archive
+                 )
+    socket = ScriptedSocket.new(transcript)
+    client = build_client(socket)
+
+    Dir.mktmpdir do |directory|
+      destination = File.join(directory, "archive.gcode.3mf")
+      remote = client.download(hints: internal_hints("Part"), destination: destination)
+
+      assert_equal "/cache/Part.gcode.3mf", remote
+      assert_equal archive, File.binread(destination)
+    end
+
+    requests = decode_client_frames(socket.written).filter_map do |magic, payload|
+      next unless magic == 0x0102013f
+
+      parsed = JSON.parse(payload)
+      parsed["cmdtype"] ? parsed : nil
+    end
+    assert_equal [1, 2, 4], requests.map { |r| r.fetch("cmdtype") }
+  end
+
   def test_full_download_fallback_requires_terminal_md5
     archive = "abcdef".b
     transcript = basic_transcript(
@@ -292,6 +336,47 @@ class NativeStorageClientTest < Minitest::Test
     end
   end
 
+  def test_accepts_response_frame_with_nonzero_reserved_header_word
+    # X2D firmware intermittently leaks uninitialized bytes into the reserved
+    # header word while the payload stays well-formed.
+    # https://github.com/ypMrg/omarchy-bambu-companion/issues/7
+    archive = "PK\x03\x04abc".b
+    transcript = frame(LOGIN_ACK, "") +
+                 control_frame("mtype" => 12_291, "sequence" => 0, "result" => 0) +
+                 dirty_frame(
+                   "mtype" => 12_289, "cmdtype" => 1, "sequence" => 1, "result" => 0,
+                   "reply" => { "file_lists" => [
+                     { "name" => "模型.gcode.3mf", "path" => "/cache/模型.gcode.3mf",
+                       "size" => archive.bytesize }
+                   ] }
+                 ) +
+                 control_frame(
+                   {
+                     "mtype" => 12_289, "cmdtype" => 2, "sequence" => 2, "result" => 1,
+                     "reply" => { "size" => 3 }
+                   }, archive.byteslice(0, 3)
+                 ) +
+                 control_frame(
+                   {
+                     "mtype" => 12_289, "cmdtype" => 2, "sequence" => 2, "result" => 0,
+                     "reply" => { "size" => 4 }
+                   }, archive.byteslice(3, 4)
+                 )
+    socket = ScriptedSocket.new(transcript)
+    client = build_client(socket)
+
+    Dir.mktmpdir do |directory|
+      destination = File.join(directory, "archive.gcode.3mf")
+      remote = client.download(hints: internal_hints("模型"), destination: destination)
+
+      assert_equal "/cache/模型.gcode.3mf", remote
+      assert_equal archive, File.binread(destination)
+    end
+
+    assert socket.closed?
+    assert_client_requests(socket.written)
+  end
+
   def test_rejects_oversized_protocol_frame_before_allocating_payload
     oversized_header = [17 << 20, LOGIN_ACK, 0, 0].pack("V4")
     client = build_client(ScriptedSocket.new(oversized_header))
@@ -374,6 +459,15 @@ class NativeStorageClientTest < Minitest::Test
       control_frame(
         "mtype" => 12_289, "cmdtype" => 2, "sequence" => 2, "result" => 10
       ) + download_frames.join
+  end
+
+  def dirty_frame(message, binary = "")
+    # Same as control_frame but with garbage in the reserved header word,
+    # as emitted by buggy X2D firmware.
+    payload = JSON.generate(message).b
+    payload += "\n\n".b + binary.b unless binary.empty?
+    bytes = payload.b
+    [bytes.bytesize, CTRL_REPLY, 0, 127].pack("V4") + bytes
   end
 
   def frame(magic, payload)

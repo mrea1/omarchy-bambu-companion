@@ -527,8 +527,13 @@ module BambuCompanion
       end
 
       def read_frame
-        length, magic, _sequence, reserved = read_exact(16).unpack("V4")
-        raise_protocol("Internal-storage frame header is invalid") unless reserved.zero?
+        length, magic, sequence, reserved = read_exact(16).unpack("V4")
+        # Some X2D firmware builds emit garbage in the reserved header word on
+        # RPC responses while the payload itself is well-formed. The reserved
+        # word carries no protocol meaning, so treat it as advisory and
+        # validate the frame through magic + length instead.
+        # https://github.com/ypMrg/omarchy-bambu-companion/issues/7
+        warn("bambu-companion: internal-storage response frame header reserved=#{reserved} sequence=#{sequence} (expected 0)") unless reserved.zero?
         raise_protocol("Internal-storage response frame is too large") if length > @max_frame_bytes
 
         [magic, read_exact(length)]
@@ -605,6 +610,13 @@ module BambuCompanion
                           ["storage_unavailable", "Internal storage is unavailable"]
                         when 18
                           ["unsupported", "Internal-storage operation is unsupported"]
+                        when 14
+                          # X2D firmware rejects SUB_FILE extraction with
+                          # result 14 while printing; the full-archive
+                          # FILE_DOWNLOAD path still works, so callers treat
+                          # this as "unsupported" and fall back.
+                          # https://github.com/ypMrg/omarchy-bambu-companion/issues/7
+                          ["unsupported", "Internal-storage operation rejected (14)"]
                         when 23
                           ["checksum", "Internal-storage checksum failed"]
                         else
