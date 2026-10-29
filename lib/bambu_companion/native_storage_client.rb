@@ -23,6 +23,10 @@ module BambuCompanion
     SERVER_LOGIN_MAGIC = 0x0001013f
     CLIENT_CTRL_MAGIC = 0x0102013f
     SERVER_CTRL_MAGIC = 0x0002013f
+    # X2D firmware ORs stray high-order bits into response magic words; only
+    # the low bits distinguish the channels.
+    # https://github.com/ypMrg/omarchy-bambu-companion/issues/7
+    HEADER_MAGIC_MASK = 0x00ffffff
     SETUP_MTYPE = 12_291
     RPC_MTYPE = 12_289
     LIST_INFO = 1
@@ -528,15 +532,18 @@ module BambuCompanion
 
       def read_frame
         length, magic, sequence, reserved = read_exact(16).unpack("V4")
-        # Some X2D firmware builds emit garbage in the reserved header word on
-        # RPC responses while the payload itself is well-formed. The reserved
-        # word carries no protocol meaning, so treat it as advisory and
-        # validate the frame through magic + length instead.
+        # Some X2D firmware builds corrupt the reserved header word and even
+        # OR high-order bits into the magic word on RPC responses while the
+        # payload itself stays well-formed. Neither field carries protocol
+        # meaning beyond the channel's low bits, so validate the frame through
+        # the masked magic + length and treat the rest as advisory.
         # https://github.com/ypMrg/omarchy-bambu-companion/issues/7
-        warn("bambu-companion: internal-storage response frame header reserved=#{reserved} sequence=#{sequence} (expected 0)") unless reserved.zero?
+        unless reserved.zero? && magic == (magic & HEADER_MAGIC_MASK)
+          warn("bambu-companion: internal-storage response frame header magic=0x#{magic.to_s(16)} reserved=#{reserved} sequence=#{sequence}")
+        end
         raise_protocol("Internal-storage response frame is too large") if length > @max_frame_bytes
 
-        [magic, read_exact(length)]
+        [magic & HEADER_MAGIC_MASK, read_exact(length)]
       end
 
       def read_exact(length)
