@@ -214,6 +214,15 @@ module BambuCompanion
       return if allow_peer_reset && error.is_a?(Errno::ECONNRESET)
       raise error if error.is_a?(TlsCertificateError) || error.is_a?(RtspsError)
 
+      if error.is_a?(Errno::ECONNREFUSED) || error.is_a?(Errno::EHOSTUNREACH)
+        # The X2/H2 camera service only listens on 322 while LAN Mode Liveview
+        # is enabled; a refused connection there usually means it is off.
+        # https://github.com/ypMrg/omarchy-bambu-companion/issues/7
+        raise RtspsError.new(
+          "unavailable", "Printer camera service is not reachable - enable LAN Mode Liveview on the printer"
+        ), cause: nil
+      end
+
       raise RtspsError.new("transport", "Camera TLS gateway failed"), cause: nil
     end
 
